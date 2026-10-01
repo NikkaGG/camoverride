@@ -75,6 +75,42 @@ static void unchanged(Parcel p, CameraIdLayout layout, int to = '2') {
     assert(patchCameraId(ops, &p, layout, '0', to).layout == 0);
     assert(p.words == before && p.pos == saved);
 }
+static Parcel deviceToken() {
+    Parcel p;
+    constexpr auto bytes = sizeof(kCameraDeviceDescriptor);
+    p.words = {0, -1, kParcelHeader, (int32_t) (bytes / 2 - 1)};
+    auto start = p.words.size();
+    p.words.resize(start + (bytes + 3) / 4, 0);
+    memcpy(p.words.data() + start, kCameraDeviceDescriptor, bytes);
+    return p;
+}
+static int decodeBlob(void *, void *p) {
+    int32_t count = 0, word = 0;
+    if (readInt(p, &count) != 0 || count < 0 || count > 100) return -1;
+    for (int i = 0; i < count; ++i) if (readInt(p, &word) != 0) return -1;
+    return 0;
+}
+static const CaptureDecoders decoders{nullptr, decodeBlob, decodeBlob, true};
+static void appendRequest(Parcel &p, int id = '0', bool tag = false, bool physical = false, bool surface = false) {
+    p.words.insert(p.words.end(), {1, physical ? 2 : 1, 1, id, 4, 1, '0', 19, 20});
+    if (physical) p.words.insert(p.words.end(), {1, '0', 2, 1, '0'}); // physical ID stays 0
+    p.words.insert(p.words.end(), {0, surface ? 1 : 0});
+    if (surface) p.words.insert(p.words.end(), {2, 1, '0'});
+    p.words.insert(p.words.end(), {1, 0, 0, tag ? 1 : 0});
+    if (tag) p.words.insert(p.words.end(), {1, '0'}); // tag stays 0
+}
+static Parcel capture(bool list, int count = 1, bool tag = false, bool physical = false, bool surface = false,
+                      std::vector<size_t> *ids = nullptr) {
+    auto p = deviceToken();
+    if (list) p.words.push_back(count);
+    for (int i = 0; i < count; ++i) {
+        if (ids) ids->push_back(p.words.size() + 3);
+        appendRequest(p, '0', tag, physical, surface);
+    }
+    p.words.push_back(1); // repeating
+    p.pos = size(&p);
+    return p;
+}
 int main() {
     int checks = 0;
     {
@@ -148,5 +184,48 @@ int main() {
         assert(p.words == before); checks++;
         assert(afterCameraServiceToken(ops, &p) == -1); checks++;
     }
-    printf("Passed %d parcel checks (protected Binder objects, offsets, front camera, disabled mode, diagnostics).\n", checks);
+    for (bool list : {false, true}) for (bool tag : {false, true}) {
+        std::vector<size_t> ids;
+        auto p = capture(list, list ? 3 : 1, tag, true, true, &ids);
+        auto expected = p.words;
+        for (auto id : ids) expected[id] = '3';
+        const auto r = patchCaptureRequests(ops, &p, decoders, list, '0', '3');
+        assert(r.status == 0 && r.requests == (list ? 3 : 1) && r.patched == r.requests);
+        assert(p.words == expected && p.pos == size(&p)); checks++;
+    }
+    {
+        auto p = deviceToken(); p.words.push_back(2);
+        appendRequest(p, '1'); appendRequest(p, '0'); p.words.push_back(0); p.pos = size(&p);
+        const auto r = patchCaptureRequests(ops, &p, decoders, true, '0', '3');
+        assert(r.status == 0 && r.patched == 1); checks++; // front request and metadata preserved
+    }
+    {
+        auto p = capture(true, 2); auto before = p.words;
+        auto r = patchCaptureRequests(ops, &p, decoders, true, '0', -1);
+        assert(r.patched == 0 && p.words == before && p.pos == size(&p)); checks++;
+        p.failWrite = true;
+        r = patchCaptureRequests(ops, &p, decoders, true, '0', '3');
+        assert(r.status == -11 && r.patched == 0 && p.words == before && p.pos == size(&p)); checks++;
+    }
+    {
+        const auto complete = capture(true, 2, true, true, true);
+        // Every possible truncation, including after a valid first request, leaves all bytes untouched.
+        for (size_t length = 0; length < complete.words.size(); ++length) {
+            auto p = complete; p.words.resize(length); p.pos = size(&p); auto before = p.words;
+            const auto r = patchCaptureRequests(ops, &p, decoders, true, '0', '3');
+            assert(r.status != 0 && r.patched == 0 && p.words == before && p.pos == size(&p));
+        }
+        checks++;
+    }
+    {
+        auto p = capture(false); p.words.erase(p.words.end() - 2); p.pos = size(&p);
+        auto old = decoders; old.userTag = false;
+        assert(patchCaptureRequests(ops, &p, old, false, '0', '3').patched == 1); checks++;
+    }
+    {
+        auto p = capture(true, 2); p.words[4] ^= 1; auto before = p.words;
+        assert(patchCaptureRequests(ops, &p, decoders, true, '0', '3').status != 0);
+        assert(p.words == before && p.pos == size(&p)); checks++;
+    }
+    printf("Passed %d parcel checks (Binder objects, capture arrays, metadata preservation, truncation, front camera).\n", checks);
 }

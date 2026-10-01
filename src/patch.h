@@ -8,6 +8,7 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 struct ParcelOps {
     int32_t (*getPos)(void *);
@@ -55,6 +56,105 @@ inline int32_t afterCameraServiceToken(const ParcelOps &ops, void *p) {
 }
 
 static const char16_t kCameraDeviceDescriptor[] = u"android.hardware.camera2.ICameraDeviceUser";
+
+// CaptureRequest parcels contain opaque CameraMetadata blobs and optionally Surface
+// objects. Let the firmware's own decoders consume those, never scan their contents.
+struct CaptureDecoders {
+    void *context;
+    int (*metadata)(void *, void *);
+    int (*surface)(void *, void *);
+    bool userTag;
+};
+struct CapturePatchResult {
+    int requests = 0;
+    int patched = 0;
+    int status = 0;
+};
+
+inline int skipString16(const ParcelOps &ops, void *p, int32_t *single = nullptr,
+                        int32_t *wordPosition = nullptr) {
+    int32_t len = 0;
+    if (ops.readInt(p, &len) != 0 || len < -1) return -1;
+    if (single) *single = -1;
+    if (wordPosition) *wordPosition = ops.getPos(p);
+    if (len == -1) return 0;
+    const int64_t bytes = ((static_cast<int64_t>(len) + 1) * 2 + 3) & ~int64_t(3);
+    if (bytes > ops.getSize(p) - ops.getPos(p)) return -1;
+    if (len == 1 && single) return ops.readInt(p, single);
+    return ops.setPos(p, ops.getPos(p) + static_cast<int32_t>(bytes));
+}
+
+// AIDL typed object presence, settings (logical first, then physical), reprocess,
+// Parcelable Surface array, cached stream/surface pairs, optional string tag.
+// Validate the entire array before changing any ID; preserve physical IDs and blobs.
+inline CapturePatchResult patchCaptureRequests(const ParcelOps &ops, void *p,
+        const CaptureDecoders &decoders, bool list, int32_t from, int32_t to) {
+    CapturePatchResult result;
+    if (to < 0 || to == from) return result;
+    const int32_t saved = ops.getPos(p);
+    std::vector<int32_t> positions;
+    const auto parse = [&]() -> int {
+        if (afterInterfaceToken(ops, p, kCameraDeviceDescriptor) < 0) return -1;
+        int32_t count = 1;
+        if (list && ops.readInt(p, &count) != 0) return -2;
+        if (count < 1 || count > 128) return -2;
+        result.requests = count;
+        for (int32_t request = 0; request < count; ++request) {
+            int32_t present = 0, settings = 0;
+            if (ops.readInt(p, &present) != 0 || present != 1 ||
+                ops.readInt(p, &settings) != 0 || settings < 1 || settings > 32) return -3;
+            for (int32_t setting = 0; setting < settings; ++setting) {
+                int32_t id = -1, word = -1;
+                if (skipString16(ops, p, &id, &word) != 0) return -4;
+                if (setting == 0 && id == from) positions.push_back(word);
+                const int32_t start = ops.getPos(p);
+                if (decoders.metadata(decoders.context, p) != 0 ||
+                    ops.getPos(p) <= start || ops.getPos(p) > ops.getSize(p)) return -5;
+            }
+            int32_t reprocess = 0, surfaces = 0, streams = 0;
+            if (ops.readInt(p, &reprocess) != 0 || (reprocess != 0 && reprocess != 1) ||
+                ops.readInt(p, &surfaces) != 0 || surfaces < -1 || surfaces > 64) return -6;
+            for (int32_t surface = 0; surface < surfaces; ++surface) {
+                const int32_t start = ops.getPos(p);
+                if (decoders.surface(decoders.context, p) != 0 ||
+                    ops.getPos(p) <= start || ops.getPos(p) > ops.getSize(p)) return -7;
+            }
+            if (ops.readInt(p, &streams) != 0 || streams < 0 ||
+                streams > (ops.getSize(p) - ops.getPos(p)) / 8) return -8;
+            for (int32_t stream = 0; stream < streams; ++stream) {
+                int32_t index = -1;
+                if (ops.readInt(p, &index) != 0 || index < 0 ||
+                    ops.readInt(p, &index) != 0 || index < 0) return -8;
+            }
+            if (decoders.userTag) {
+                int32_t tag = 0;
+                if (ops.readInt(p, &tag) != 0 || (tag != 0 && tag != 1) ||
+                    (tag == 1 && skipString16(ops, p) != 0)) return -9;
+            }
+        }
+        int32_t streaming = 0;
+        if (ops.readInt(p, &streaming) != 0 || (streaming != 0 && streaming != 1) ||
+            ops.getPos(p) != ops.getSize(p)) return -10;
+        return 0;
+    };
+    result.status = parse();
+    if (result.status == 0) {
+        for (auto word : positions) {
+            if (ops.setPos(p, word) != 0 || ops.writeInt(p, to) != 0) {
+                result.status = -11;
+                // Roll back a failed write so a burst never mixes logical IDs.
+                for (auto restore : positions) {
+                    if (ops.setPos(p, restore) == 0) ops.writeInt(p, from);
+                }
+                result.patched = 0;
+                break;
+            }
+            ++result.patched;
+        }
+    }
+    ops.setPos(p, saved);
+    return result;
+}
 
 // Parse only the known cameraId argument of a resolved ICameraService transaction.
 // Never scan arbitrary words: other arguments can coincidentally contain [1, '0'].

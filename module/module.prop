@@ -1,6 +1,6 @@
 id=camoverride
 name=CameraOverride (Zygisk)
-version=v0.4
-versionCode=4
+version=v0.5
+versionCode=5
 author=klklkl
-description=Redirects rear Camera2 in Instagram, TikTok and Telegram to a selected camera ID. Default 0 -> 2. Logs camera open and session errors. No LSPosed needed.
+description=Redirects rear Camera2 and capture request IDs in Instagram, TikTok and Telegram. Default 0 -> 3 for Poco X4 Pro. Logs camera/session errors. No LSPosed needed.
