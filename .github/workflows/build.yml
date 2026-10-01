@@ -9,6 +9,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Test parcel parsing (host)
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined \
+            -fno-omit-frame-pointer -g tests/patch_test.cpp -o /tmp/camoverride-tests
+          /tmp/camoverride-tests
+
       - name: Build (arm64-v8a)
         run: |
           cmake -S . -B build \

@@ -1,6 +1,6 @@
 id=camoverride
 name=CameraOverride (Zygisk)
-version=v0.2
-versionCode=2
+version=v0.3
+versionCode=3
 author=klklkl
 description=Makes the rear camera in selected apps (Instagram, TikTok, Telegram) open as another camera ID, e.g. the ultrawide (0.5x). No LSPosed needed.

@@ -15,14 +15,20 @@ struct ParcelOps {
     int (*setPos)(void *, int32_t);       // 0 = ok
     int (*readInt)(void *, int32_t *);    // 0 = ok
     int (*writeInt)(void *, int32_t);     // 0 = ok
+    int (*skipBinder)(void *);            // reads/releases a strong Binder, including stability
 };
 
 static const char16_t kCameraServiceDescriptor[] = u"android.hardware.ICameraService";
 static const int32_t kDescriptorLen =
         (int32_t) (sizeof(kCameraServiceDescriptor) / sizeof(char16_t)) - 1;  // 31
 static const int32_t kParcelHeader = 0x53595354;  // 'SYST'
-// How far after the descriptor (in int32 units) to look for [len=1][id].
-static const int kScanInts = 16;
+enum class CameraIdLayout { None, FirstString, BinderThenString };
+
+struct CameraPatchResult {
+    int layout = 0;
+    int32_t idOffset = -1;
+    int status = 0;
+};
 
 // Reads the interface token from position 0. Returns the position right after the descriptor,
 // or -1 if this parcel is not an ICameraService call. Leaves the read position undefined.
@@ -43,27 +49,34 @@ inline int32_t afterCameraServiceToken(const ParcelOps &ops, void *p) {
     return ops.getPos(p);
 }
 
-// fromChar: camera ID character to replace (e.g. '0').
-// toFn: returns the replacement character, or -1 to leave the parcel untouched
-//       (only called once the parcel really is an ICameraService call carrying fromChar).
-// Returns 0 = untouched, otherwise 1 + (int32 offset of the ID after the descriptor):
-//   1 = ID is the first argument, 8 = after a binder object.
-inline int patchCameraId(const ParcelOps &ops, void *p, int32_t fromChar, int32_t (*toFn)()) {
+// Parse only the known cameraId argument of a resolved ICameraService transaction.
+// Never scan arbitrary words: other arguments can coincidentally contain [1, '0'].
+// The Binder API, not a guessed 24/28-byte offset, consumes callbacks and stability.
+inline CameraPatchResult patchCameraId(const ParcelOps &ops, void *p, CameraIdLayout layout,
+                                      int32_t fromChar, int32_t toChar) {
     const int32_t size = ops.getSize(p);
     const int32_t saved = ops.getPos(p);
-    int result = 0;
+    CameraPatchResult result;
+    if (layout == CameraIdLayout::None || toChar < 0 || toChar == fromChar) return result;
     const int32_t base = afterCameraServiceToken(ops, p);
     if (base >= 0) {
-        for (int k = 0; k < kScanInts; k++) {
-            const int32_t c = base + 4 * k;
-            if (c + 8 > size) break;
+        bool readable = true;
+        if (layout == CameraIdLayout::BinderThenString) {
+            result.status = ops.skipBinder(p);
+            readable = result.status == 0;
+        }
+        const int32_t c = ops.getPos(p);
+        if (readable && c >= base && c <= size - 8) {
+            result.idOffset = c - base;
             int32_t len = 0, id = 0;
-            if (ops.setPos(p, c) != 0 || ops.readInt(p, &len) != 0 || ops.readInt(p, &id) != 0) break;
+            result.status = ops.readInt(p, &len);
+            const int32_t idPos = ops.getPos(p);
+            if (result.status == 0) result.status = ops.readInt(p, &id);
             // UTF-16LE "X" + NUL packs into one int32 whose value is X
-            if (len == 1 && id == fromChar) {
-                const int32_t to = toFn();
-                if (to >= 0 && ops.setPos(p, c + 4) == 0 && ops.writeInt(p, to) == 0) result = k + 1;
-                break;
+            if (result.status == 0 && len == 1 && id == fromChar) {
+                result.status = ops.setPos(p, idPos);
+                if (result.status == 0) result.status = ops.writeInt(p, toChar);
+                if (result.status == 0) result.layout = (c - base) / 4 + 1;
             }
         }
     }
@@ -73,15 +86,24 @@ inline int patchCameraId(const ParcelOps &ops, void *p, int32_t fromChar, int32_
 
 // Diagnostics: copies up to maxInts int32 words that follow the descriptor into out.
 // Returns the number copied, or -1 if the parcel is not an ICameraService call. Never modifies the parcel.
-inline int dumpCameraCall(const ParcelOps &ops, void *p, int32_t *out, int maxInts) {
+inline int dumpCameraCall(const ParcelOps &ops, void *p, CameraIdLayout layout,
+                          int32_t *out, int maxInts, int32_t *argsOffset, int *readStatus) {
     const int32_t size = ops.getSize(p);
     const int32_t saved = ops.getPos(p);
     int n = -1;
     const int32_t base = afterCameraServiceToken(ops, p);
     if (base >= 0) {
         n = 0;
-        if (ops.setPos(p, base) == 0) {
-            while (n < maxInts && base + 4 * (n + 1) <= size && ops.readInt(p, &out[n]) == 0) n++;
+        *readStatus = 0;
+        if (layout == CameraIdLayout::BinderThenString) *readStatus = ops.skipBinder(p);
+        const int32_t start = ops.getPos(p);
+        *argsOffset = start - base;
+        if (*readStatus == 0) {
+            while (n < maxInts && start + 4 * (n + 1) <= size) {
+                *readStatus = ops.readInt(p, &out[n]);
+                if (*readStatus != 0) break;
+                n++;
+            }
         }
     }
     ops.setPos(p, saved);
