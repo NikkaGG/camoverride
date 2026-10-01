@@ -1,19 +1,25 @@
-// CameraOverride (Zygisk) — forces the rear camera of selected apps to a different
-// camera ID (default: "2", the ultrawide on Poco X4 Pro) by hooking the NDK Camera2 API.
+// CameraOverride (Zygisk) — makes the rear camera in selected apps open as another camera ID
+// (default "2" = ultrawide on Poco X4 Pro), without LSPosed.
 //
-// Runtime control (no rebuild needed), run as root:
-//   setprop debug.camoverride.id 2     # target ID (try 2, 5, 6)
-//   setprop debug.camoverride.id off   # disable remap
+// How: hooks the JNI native android.os.BinderProxy.transactNative inside the target app and,
+// for calls to cameraserver (ICameraService), rewrites the camera ID "0" -> "2" in the parcel.
+// Works for Java Camera2 and NDK Camera2 alike, since both go through binder.
+//
+// Runtime control (no rebuild), as root, then reopen the camera:
+//   setprop debug.camoverride.id 2     # try 2, 5, 6
+//   setprop debug.camoverride.id off   # disable
 // Logs: adb logcat -s CamOverride
 
 #include <jni.h>
 #include <android/log.h>
 #include <dlfcn.h>
 #include <sys/system_properties.h>
+#include <cstdint>
 #include <cstring>
+#include <sys/types.h>
 
 #include "zygisk.hpp"
-#include "dobby.h"
+#include "patch.h"
 
 #define TAG "CamOverride"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -36,55 +42,65 @@ static bool isTarget(const char *name) {
     return false;
 }
 
-// Rear main camera "0" -> configured ID. Everything else (front "1", etc.) untouched.
-static const char *mapId(const char *id) {
-    if (!id || strcmp(id, "0") != 0) return id;
-    static thread_local char buf[PROP_VALUE_MAX];
+// ---- libbinder_ndk (public NDK library), resolved with dlsym ----
+struct AParcel;
+static AParcel *(*p_fromJava)(JNIEnv *, jobject) = nullptr;
+static void (*p_delete)(AParcel *) = nullptr;
+static int32_t (*p_getPos)(const AParcel *) = nullptr;
+static int32_t (*p_getSize)(const AParcel *) = nullptr;
+static int32_t (*p_setPos)(const AParcel *, int32_t) = nullptr;
+static int32_t (*p_readInt)(const AParcel *, int32_t *) = nullptr;
+static int32_t (*p_writeInt)(AParcel *, int32_t) = nullptr;
+
+static int32_t op_getPos(void *p) { return p_getPos((AParcel *) p); }
+static int32_t op_getSize(void *p) { return p_getSize((AParcel *) p); }
+static int op_setPos(void *p, int32_t v) { return p_setPos((AParcel *) p, v); }
+static int op_readInt(void *p, int32_t *o) { return p_readInt((AParcel *) p, o); }
+static int op_writeInt(void *p, int32_t v) { return p_writeInt((AParcel *) p, v); }
+static const ParcelOps kOps = {op_getPos, op_getSize, op_setPos, op_readInt, op_writeInt};
+
+// Replacement camera ID character ('2' by default); -1 = disabled via property.
+static int32_t targetChar() {
     char v[PROP_VALUE_MAX] = {0};
     __system_property_get("debug.camoverride.id", v);
-    if (strcmp(v, "off") == 0) return id;
-    strncpy(buf, v[0] ? v : "2", sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
-    return buf;
+    if (strcmp(v, "off") == 0) return -1;
+    if (v[0] != '\0' && v[1] == '\0') return (unsigned char) v[0];  // single-char IDs only (in-place patch)
+    return '2';
 }
 
-// camera_status_t ACameraManager_openCamera(ACameraManager*, const char*, ACameraDevice_StateCallbacks*, ACameraDevice**)
-typedef int (*open_t)(void *, const char *, void *, void **);
-static open_t orig_open = nullptr;
-static int my_open(void *mgr, const char *id, void *cb, void **dev) {
-    const char *nid = mapId(id);
-    if (nid != id) LOGI("openCamera %s -> %s", id, nid);
-    return orig_open(mgr, nid, cb, dev);
+typedef jboolean (*transact_t)(JNIEnv *, jobject, jint, jobject, jobject, jint);
+static transact_t orig_transact = nullptr;
+
+static jboolean my_transact(JNIEnv *env, jobject thiz, jint code, jobject data, jobject reply, jint flags) {
+    if (data != nullptr) {
+        AParcel *p = p_fromJava(env, data);
+        if (p != nullptr) {
+            int r = patchCameraId(kOps, p, '0', targetChar);
+            if (r != 0) LOGI("ICameraService call code=%d (layout %d): camera 0 -> %c", code, r, (char) targetChar());
+            p_delete(p);
+        }
+    }
+    return orig_transact(env, thiz, code, data, reply, flags);
 }
 
-// camera_status_t ACameraManager_getCameraCharacteristics(ACameraManager*, const char*, ACameraMetadata**)
-typedef int (*chars_t)(void *, const char *, void **);
-static chars_t orig_chars = nullptr;
-static int my_chars(void *mgr, const char *id, void **out) {
-    const char *nid = mapId(id);
-    if (nid != id) LOGI("getCameraCharacteristics %s -> %s", id, nid);
-    return orig_chars(mgr, nid, out);
-}
-
-static void installHooks() {
-    // Force-load the NDK camera lib so it is mapped now, even if the app loads it later.
-    void *h = dlopen("libcamera2ndk.so", RTLD_NOW);
+static bool loadBinderNdk() {
+    void *h = dlopen("libbinder_ndk.so", RTLD_NOW);
     if (!h) {
-        LOGI("dlopen libcamera2ndk.so failed: %s", dlerror());
-        return;
+        LOGI("dlopen libbinder_ndk.so failed: %s", dlerror());
+        return false;
     }
-    void *p_open = dlsym(h, "ACameraManager_openCamera");
-    void *p_chars = dlsym(h, "ACameraManager_getCameraCharacteristics");
-    if (p_open) {
-        int r = DobbyHook(p_open, reinterpret_cast<void *>(my_open),
-                          reinterpret_cast<void **>(&orig_open));
-        LOGI("hook openCamera: %d", r);
+    p_fromJava = (decltype(p_fromJava)) dlsym(h, "AParcel_fromJavaParcel");
+    p_delete = (decltype(p_delete)) dlsym(h, "AParcel_delete");
+    p_getPos = (decltype(p_getPos)) dlsym(h, "AParcel_getDataPosition");
+    p_getSize = (decltype(p_getSize)) dlsym(h, "AParcel_getDataSize");
+    p_setPos = (decltype(p_setPos)) dlsym(h, "AParcel_setDataPosition");
+    p_readInt = (decltype(p_readInt)) dlsym(h, "AParcel_readInt32");
+    p_writeInt = (decltype(p_writeInt)) dlsym(h, "AParcel_writeInt32");
+    if (!p_fromJava || !p_delete || !p_getPos || !p_getSize || !p_setPos || !p_readInt || !p_writeInt) {
+        LOGI("missing libbinder_ndk symbols (fromJava=%p)", (void *) p_fromJava);
+        return false;
     }
-    if (p_chars) {
-        int r = DobbyHook(p_chars, reinterpret_cast<void *>(my_chars),
-                          reinterpret_cast<void **>(&orig_chars));
-        LOGI("hook getCameraCharacteristics: %d", r);
-    }
+    return true;
 }
 
 class CamOverride : public zygisk::ModuleBase {
@@ -103,9 +119,19 @@ public:
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
-        if (target) {
-            LOGI("target app detected, installing hooks");
-            installHooks();
+        if (!target) return;
+        LOGI("target app detected, hooking BinderProxy.transactNative");
+        if (!loadBinderNdk()) return;
+
+        JNINativeMethod m[] = {
+            {"transactNative", "(ILandroid/os/Parcel;Landroid/os/Parcel;I)Z", (void *) my_transact},
+        };
+        api->hookJniNativeMethods(env, "android/os/BinderProxy", m, 1);
+        orig_transact = (transact_t) m[0].fnPtr;
+        if (orig_transact == nullptr) {
+            LOGI("transactNative not found / hook failed");
+        } else {
+            LOGI("hook installed");
         }
     }
 

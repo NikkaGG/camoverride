@@ -9,9 +9,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch Dobby
-        run: git clone --depth 1 https://github.com/jmpews/Dobby external/Dobby
-
       - name: Build (arm64-v8a)
         run: |
           cmake -S . -B build \
