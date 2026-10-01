@@ -32,22 +32,29 @@ struct CameraPatchResult {
 
 // Reads the interface token from position 0. Returns the position right after the descriptor,
 // or -1 if this parcel is not an ICameraService call. Leaves the read position undefined.
-inline int32_t afterCameraServiceToken(const ParcelOps &ops, void *p) {
-    // strict mode(4) + work source(4) + header(4) + descriptor len(4) + descriptor(64)
-    if (ops.getSize(p) < 12 + 4 + (int32_t) sizeof(kCameraServiceDescriptor)) return -1;
+template <size_t N>
+inline int32_t afterInterfaceToken(const ParcelOps &ops, void *p, const char16_t (&descriptor)[N]) {
+    constexpr size_t wordCount = (sizeof(descriptor) + 3) / 4;
+    if (ops.getSize(p) < 16 + (int32_t) (wordCount * 4)) return -1;
     if (ops.setPos(p, 0) != 0) return -1;
     int32_t v = 0;
     if (ops.readInt(p, &v) != 0) return -1;                         // strict mode policy
     if (ops.readInt(p, &v) != 0) return -1;                         // work source uid
     if (ops.readInt(p, &v) != 0 || v != kParcelHeader) return -1;   // 'SYST'
-    if (ops.readInt(p, &v) != 0 || v != kDescriptorLen) return -1;  // descriptor length (chars)
-    int32_t w[sizeof(kCameraServiceDescriptor) / sizeof(int32_t)];
+    if (ops.readInt(p, &v) != 0 || v != (int32_t) N - 1) return -1;
+    int32_t w[wordCount];
     for (auto &x : w) {
         if (ops.readInt(p, &x) != 0) return -1;
     }
-    if (memcmp(w, kCameraServiceDescriptor, sizeof(kCameraServiceDescriptor)) != 0) return -1;
+    if (memcmp(w, descriptor, sizeof(descriptor)) != 0) return -1;
     return ops.getPos(p);
 }
+
+inline int32_t afterCameraServiceToken(const ParcelOps &ops, void *p) {
+    return afterInterfaceToken(ops, p, kCameraServiceDescriptor);
+}
+
+static const char16_t kCameraDeviceDescriptor[] = u"android.hardware.camera2.ICameraDeviceUser";
 
 // Parse only the known cameraId argument of a resolved ICameraService transaction.
 // Never scan arbitrary words: other arguments can coincidentally contain [1, '0'].

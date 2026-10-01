@@ -1,4 +1,4 @@
-# CameraOverride v0.3
+# CameraOverride v0.4
 
 Zygisk module redirecting camera ID `0` to ID `2` in Instagram, TikTok and Telegram.
 The intended use is the ultrawide rear camera in Instagram's instant photo mode.
@@ -65,3 +65,34 @@ and capture `adb shell dumpsys media.camera` while the stock 0.6x camera is open
 
 Android build and host tests can run in CI. Physical camera output must be tested
 on the phone; the build cannot establish sensor availability or Instagram output.
+
+## v0.4 black screen diagnostics
+
+The module logs the real Binder status reply for camera characteristics, opening,
+stream creation and session configuration. It includes `ok`, `exception`,
+`service_error`, `transport` and `message`, while restoring the reply position
+so that Instagram receives the original reply unchanged. Camera frame submission
+replies are logged only when they fail. No permission, identity or camera-service
+checks are changed, and a rejected camera open is not masked as success.
+
+After installing/rebooting, choose one target ID (start with `2`) and capture a
+single attempt in Instagram. On Windows CMD:
+
+```bat
+adb shell su -c "setprop debug.camoverride.id 2"
+adb shell am force-stop com.instagram.android
+adb logcat -c
+```
+
+Open instant photo, wait for the error, then save the relevant logs:
+
+```bat
+adb logcat -d -v threadtime | findstr /i "CamOverride CameraService CameraProvider CameraDevice Camera3 CameraManager configureStreams" > camera-log.txt
+adb shell dumpsys media.camera > camera-info.txt
+```
+
+These are diagnostics, not confirmation that the 0.6x sensor works. If
+`connectDevice reply ... ok=0`, its message explains the open rejection. If it
+returns `ok=1`, inspect stream/session errors and the camera service event log.
+Do not keep changing target IDs within the same attempt: characteristic caches
+and an existing session can then describe different devices.

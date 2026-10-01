@@ -134,5 +134,19 @@ int main() {
         assert(dumpCameraCall(ops, &p, CameraIdLayout::None, words, 24, &offset, &status) == 0);
         assert(status != 0 && p.words == before && p.pos == size(&p)); checks++;
     }
+    {
+        Parcel p;
+        constexpr auto bytes = sizeof(kCameraDeviceDescriptor);
+        p.words = {0, -1, kParcelHeader, (int32_t) (bytes / 2 - 1)};
+        auto start = p.words.size();
+        p.words.resize(start + (bytes + 3) / 4, 0);
+        memcpy(p.words.data() + start, kCameraDeviceDescriptor, bytes);
+        const auto tokenEnd = size(&p);
+        p.words.push_back(0);
+        auto before = p.words;
+        assert(afterInterfaceToken(ops, &p, kCameraDeviceDescriptor) == tokenEnd);
+        assert(p.words == before); checks++;
+        assert(afterCameraServiceToken(ops, &p) == -1); checks++;
+    }
     printf("Passed %d parcel checks (protected Binder objects, offsets, front camera, disabled mode, diagnostics).\n", checks);
 }

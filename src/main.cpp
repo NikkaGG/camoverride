@@ -47,6 +47,7 @@ static bool isTarget(const char *name) {
 // ---- libbinder_ndk (public NDK library), resolved with dlsym ----
 struct AParcel;
 struct AIBinder;
+struct AStatus;
 static AParcel *(*p_fromJava)(JNIEnv *, jobject) = nullptr;
 static void (*p_delete)(AParcel *) = nullptr;
 static int32_t (*p_getPos)(const AParcel *) = nullptr;
@@ -56,6 +57,14 @@ static int32_t (*p_readInt)(const AParcel *, int32_t *) = nullptr;
 static int32_t (*p_writeInt)(AParcel *, int32_t) = nullptr;
 static int32_t (*p_readBinder)(const AParcel *, AIBinder **) = nullptr;
 static void (*p_decStrong)(AIBinder *) = nullptr;
+static int32_t (*p_readStatus)(const AParcel *, AStatus **) = nullptr;
+static bool (*p_statusOk)(const AStatus *) = nullptr;
+static int32_t (*p_exception)(const AStatus *) = nullptr;
+static int32_t (*p_serviceError)(const AStatus *) = nullptr;
+static int32_t (*p_transportStatus)(const AStatus *) = nullptr;
+static const char *(*p_statusMessage)(const AStatus *) = nullptr;
+static void (*p_deleteStatus)(AStatus *) = nullptr;
+static bool g_replyDiagnostics = false;
 
 static int32_t op_getPos(void *p) { return p_getPos((AParcel *) p); }
 static int32_t op_getSize(void *p) { return p_getSize((AParcel *) p); }
@@ -87,17 +96,26 @@ static CameraMethod kMethods[] = {
     {"isSessionConfigurationWithParametersSupported", CameraIdLayout::FirstString},
     {"getSessionCharacteristics", CameraIdLayout::FirstString},
 };
+static CameraMethod kDeviceMethods[] = {
+    {"beginConfigure", CameraIdLayout::None},
+    {"endConfigure", CameraIdLayout::None},
+    {"createStream", CameraIdLayout::None},
+    {"createDefaultRequest", CameraIdLayout::None},
+    {"submitRequest", CameraIdLayout::None},
+    {"submitRequestList", CameraIdLayout::None},
+};
 
 // Transaction numbers change across Android versions. Resolve the firmware's
 // generated Stub constants before installing the hook; never guess the method.
-static bool resolveCameraMethods(JNIEnv *env) {
-    jclass stub = env->FindClass("android/hardware/ICameraService$Stub");
+template <size_t N>
+static bool resolveMethods(JNIEnv *env, const char *className, CameraMethod (&methods)[N]) {
+    jclass stub = env->FindClass(className);
     if (stub == nullptr || env->ExceptionCheck()) {
         env->ExceptionClear();
-        LOGI("Cannot resolve ICameraService$Stub; hook disabled");
+        LOGI("Cannot resolve %s", className);
         return false;
     }
-    for (auto &method : kMethods) {
+    for (auto &method : methods) {
         char fieldName[128] = {};
         snprintf(fieldName, sizeof(fieldName), "TRANSACTION_%s", method.name);
         jfieldID field = env->GetStaticFieldID(stub, fieldName, "I");
@@ -112,15 +130,52 @@ static bool resolveCameraMethods(JNIEnv *env) {
         }
     }
     env->DeleteLocalRef(stub);
+    return true;
+}
+
+static bool resolveCameraMethods(JNIEnv *env) {
+    if (!resolveMethods(env, "android/hardware/ICameraService$Stub", kMethods)) return false;
+    resolveMethods(env, "android/hardware/camera2/ICameraDeviceUser$Stub", kDeviceMethods);
     const bool ready = kMethods[0].code > 0 && kMethods[1].code > 0;
-    LOGI("v0.3 transactions: connectDevice=%d getCameraCharacteristics=%d ready=%d",
+    LOGI("v0.4 transactions: connectDevice=%d getCameraCharacteristics=%d ready=%d",
          kMethods[0].code, kMethods[1].code, ready);
     return ready;
 }
 
-static const CameraMethod *cameraMethod(jint code) {
-    for (const auto &method : kMethods) if (method.code == code) return &method;
+template <size_t N>
+static const CameraMethod *cameraMethod(jint code, const CameraMethod (&methods)[N]) {
+    for (const auto &method : methods) if (method.code == code) return &method;
     return nullptr;
+}
+
+// Read the service's actual reply, preserving it for the application's own decoder.
+// Never turn a rejected open into success or consume/clear the app's exception.
+static void logCameraReply(JNIEnv *env, jobject reply, const char *iface,
+                           const CameraMethod *method, int32_t redirectedTo) {
+    if (!g_replyDiagnostics || reply == nullptr) return;
+    AParcel *p = p_fromJava(env, reply);
+    if (p == nullptr) return;
+    const int32_t saved = p_getPos(p);
+    AStatus *status = nullptr;
+    int readStatus = p_setPos(p, 0);
+    if (readStatus == 0) readStatus = p_readStatus(p, &status);
+    if (readStatus == 0 && status != nullptr) {
+        const bool ok = p_statusOk(status);
+        // Repeating capture submissions can be frequent: print failures plus open/configuration.
+        const bool repetitive = strncmp(method->name, "submitRequest", 13) == 0;
+        if (!ok || !repetitive) {
+            const char *message = p_statusMessage(status);
+            LOGI("%s reply method=%s redirected_to=%d ok=%d exception=%d service_error=%d transport=%d message=%s",
+                 iface, method->name, redirectedTo >= 0 ? redirectedTo - '0' : -1, ok,
+                 p_exception(status), p_serviceError(status), p_transportStatus(status),
+                 message && message[0] ? message : "<none>");
+        }
+    } else {
+        LOGI("%s reply method=%s status_read_error=%d", iface, method->name, readStatus);
+    }
+    if (status != nullptr) p_deleteStatus(status);
+    p_setPos(p, saved);
+    p_delete(p);
 }
 
 // Replacement camera ID character ('2' by default); -1 = disabled via property.
@@ -159,14 +214,32 @@ static void dumpUnpatched(const AParcel *p, jint code, const CameraMethod *metho
 }
 
 static jboolean my_transact(JNIEnv *env, jobject thiz, jint code, jobject data, jobject reply, jint flags) {
+    const CameraMethod *observed = nullptr;
+    const char *observedInterface = nullptr;
+    int32_t redirectedTo = -1;
     if (data != nullptr) {
         AParcel *p = p_fromJava(env, data);
         if (p != nullptr) {
-            const CameraMethod *method = cameraMethod(code);
+            const CameraMethod *method = cameraMethod(code, kMethods);
+            const int32_t saved = p_getPos(p);
+            if (method != nullptr && afterCameraServiceToken(kOps, p) >= 0) {
+                observed = method;
+                observedInterface = "ICameraService";
+            }
+            p_setPos(p, saved);
+            if (observed == nullptr) {
+                const CameraMethod *deviceMethod = cameraMethod(code, kDeviceMethods);
+                if (deviceMethod != nullptr && afterInterfaceToken(kOps, p, kCameraDeviceDescriptor) >= 0) {
+                    observed = deviceMethod;
+                    observedInterface = "ICameraDeviceUser";
+                }
+                p_setPos(p, saved);
+            }
             const int32_t to = targetChar();  // one consistent value per transaction
             const auto layout = method ? method->layout : CameraIdLayout::None;
             const auto r = patchCameraId(kOps, p, layout, '0', to);
             if (r.layout != 0) {
+                redirectedTo = to;
                 LOGI("ICameraService code=%d method=%s (layout %d offset=%d): camera 0 -> %c",
                      code, method->name, r.layout, r.idOffset, (char) to);
             } else if (g_dumpBudget.load(std::memory_order_relaxed) > 0) {
@@ -175,7 +248,18 @@ static jboolean my_transact(JNIEnv *env, jobject thiz, jint code, jobject data, 
             p_delete(p);
         }
     }
-    return orig_transact(env, thiz, code, data, reply, flags);
+    const jboolean result = orig_transact(env, thiz, code, data, reply, flags);
+    if (observed != nullptr) {
+        // A pending Java transport exception belongs to the app; do not clear it.
+        if (env->ExceptionCheck()) {
+            LOGI("%s method=%s JNI transport exception pending", observedInterface, observed->name);
+        } else if (result == JNI_FALSE) {
+            LOGI("%s method=%s transact returned false", observedInterface, observed->name);
+        } else if ((flags & 1) == 0) {
+            logCameraReply(env, reply, observedInterface, observed, redirectedTo);
+        }
+    }
+    return result;
 }
 
 static bool loadBinderNdk() {
@@ -193,6 +277,16 @@ static bool loadBinderNdk() {
     p_writeInt = (decltype(p_writeInt)) dlsym(h, "AParcel_writeInt32");
     p_readBinder = (decltype(p_readBinder)) dlsym(h, "AParcel_readStrongBinder");
     p_decStrong = (decltype(p_decStrong)) dlsym(h, "AIBinder_decStrong");
+    p_readStatus = (decltype(p_readStatus)) dlsym(h, "AParcel_readStatusHeader");
+    p_statusOk = (decltype(p_statusOk)) dlsym(h, "AStatus_isOk");
+    p_exception = (decltype(p_exception)) dlsym(h, "AStatus_getExceptionCode");
+    p_serviceError = (decltype(p_serviceError)) dlsym(h, "AStatus_getServiceSpecificError");
+    p_transportStatus = (decltype(p_transportStatus)) dlsym(h, "AStatus_getStatus");
+    p_statusMessage = (decltype(p_statusMessage)) dlsym(h, "AStatus_getMessage");
+    p_deleteStatus = (decltype(p_deleteStatus)) dlsym(h, "AStatus_delete");
+    g_replyDiagnostics = p_readStatus && p_statusOk && p_exception && p_serviceError &&
+                         p_transportStatus && p_statusMessage && p_deleteStatus;
+    LOGI("service reply diagnostics available=%d", g_replyDiagnostics);
     if (!p_fromJava || !p_delete || !p_getPos || !p_getSize || !p_setPos || !p_readInt ||
         !p_writeInt || !p_readBinder || !p_decStrong) {
         LOGI("missing libbinder_ndk symbols (fromJava=%p)", (void *) p_fromJava);
