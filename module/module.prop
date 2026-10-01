@@ -1,0 +1,6 @@
+id=camoverride
+name=CameraOverride (Zygisk)
+version=v0.1
+versionCode=1
+author=klklkl
+description=Forces the rear camera in selected apps (Instagram, TikTok, Telegram) to a chosen camera ID, e.g. the ultrawide (0.5x).
