@@ -2,8 +2,8 @@
 //
 // Idea: every app talks to cameraserver through binder (interface "android.hardware.ICameraService").
 // Both the Java Camera2 API and the NDK one end up sending the camera ID as a string in the parcel:
-//   connectDevice(callbacks, cameraId, ...)         -> [binder object, 24 bytes][len=1]["0"]
-//   getCameraCharacteristics(cameraId, ...) etc.    ->                         [len=1]["0"]
+//   connectDevice(callbacks, cameraId, ...)         -> [binder object + stability word][len=1]["0"]
+//   getCameraCharacteristics(cameraId, ...) etc.    ->                                [len=1]["0"]
 // "0" and "2" are both 1 UTF-16 char, so the ID can be overwritten in place (no resizing).
 #pragma once
 #include <cstdint>
@@ -21,12 +21,15 @@ static const char16_t kCameraServiceDescriptor[] = u"android.hardware.ICameraSer
 static const int32_t kDescriptorLen =
         (int32_t) (sizeof(kCameraServiceDescriptor) / sizeof(char16_t)) - 1;  // 31
 static const int32_t kParcelHeader = 0x53595354;  // 'SYST'
-static const int32_t kFlatBinderObjectSize = 24;  // 64-bit
+// How far after the descriptor (in int32 units) to look for [len=1][id]. A binder object in a
+// parcel is 24 bytes + a 4-byte stability word, so connectDevice's ID sits 7 ints in; scan a bit wider.
+static const int kScanInts = 16;
 
 // fromChar: camera ID character to replace (e.g. '0').
 // toFn: returns the replacement character, or -1 to leave the parcel untouched
 //       (only called once the parcel really is an ICameraService call carrying fromChar).
-// Returns 0 = untouched, 1 = patched (ID is first argument), 2 = patched (ID follows a binder object).
+// Returns 0 = untouched, otherwise 1 + (int32 offset of the ID after the descriptor):
+//   1 = ID is the first argument (getCameraCharacteristics...), 8 = after a binder object (connectDevice).
 inline int patchCameraId(const ParcelOps &ops, void *p, int32_t fromChar, int32_t (*toFn)()) {
     const int32_t size = ops.getSize(p);
     // strict mode(4) + work source(4) + header(4) + descriptor len(4) + descriptor(64) + id len(4) + id(4)
@@ -50,16 +53,15 @@ inline int patchCameraId(const ParcelOps &ops, void *p, int32_t fromChar, int32_
         if (!ok || memcmp(w, kCameraServiceDescriptor, sizeof(kCameraServiceDescriptor)) != 0) break;
 
         const int32_t base = ops.getPos(p);
-        const int32_t candidates[2] = {base, base + kFlatBinderObjectSize};
-        for (int i = 0; i < 2; i++) {
-            const int32_t c = candidates[i];
-            if (c + 8 > size) continue;
+        for (int k = 0; k < kScanInts; k++) {
+            const int32_t c = base + 4 * k;
+            if (c + 8 > size) break;
             int32_t len = 0, id = 0;
-            if (ops.setPos(p, c) != 0 || ops.readInt(p, &len) != 0 || ops.readInt(p, &id) != 0) continue;
+            if (ops.setPos(p, c) != 0 || ops.readInt(p, &len) != 0 || ops.readInt(p, &id) != 0) break;
             // UTF-16LE "X" + NUL packs into one int32 whose value is X
             if (len == 1 && id == fromChar) {
                 const int32_t to = toFn();
-                if (to >= 0 && ops.setPos(p, c + 4) == 0 && ops.writeInt(p, to) == 0) result = i + 1;
+                if (to >= 0 && ops.setPos(p, c + 4) == 0 && ops.writeInt(p, to) == 0) result = k + 1;
                 break;
             }
         }
