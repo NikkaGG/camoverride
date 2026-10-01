@@ -1,0 +1,38 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Dobby
+        run: git clone --depth 1 https://github.com/jmpews/Dobby external/Dobby
+
+      - name: Build (arm64-v8a)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-29 \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+
+      - name: Assemble Magisk module
+        run: |
+          mkdir -p out/zygisk out/META-INF/com/google/android
+          cp build/libcamoverride.so out/zygisk/arm64-v8a.so
+          cp module/module.prop out/
+          curl -sSfL -o out/META-INF/com/google/android/update-binary \
+            https://raw.githubusercontent.com/topjohnwu/Magisk/master/scripts/module_installer.sh
+          echo '#MAGISK' > out/META-INF/com/google/android/updater-script
+
+      # Uploading the folder (not a zip) avoids a zip-inside-zip: the downloaded
+      # artifact is itself the installable module zip.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CameraOverride-zygisk
+          path: out
