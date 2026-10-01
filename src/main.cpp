@@ -15,6 +15,7 @@
 #include <dlfcn.h>
 #include <sys/system_properties.h>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <sys/types.h>
 
@@ -71,12 +72,31 @@ static int32_t targetChar() {
 typedef jboolean (*transact_t)(JNIEnv *, jobject, jint, jobject, jobject, jint);
 static transact_t orig_transact = nullptr;
 
+// Diagnostics: log the first N ICameraService calls we did NOT patch, with the raw words after the
+// interface token, so the real parcel layout of e.g. connectDevice can be read from logcat.
+static int g_dumpBudget = 120;
+
+static void dumpUnpatched(const AParcel *p, jint code) {
+    int32_t words[24];
+    int n = dumpCameraCall(kOps, (void *) p, words, 24);
+    if (n < 0) return;
+    g_dumpBudget--;
+    char buf[24 * 9 + 1];
+    int off = 0;
+    for (int i = 0; i < n; i++) off += snprintf(buf + off, sizeof(buf) - off, "%x ", (unsigned) words[i]);
+    LOGI("ICameraService code=%d size=%d unpatched words: %s", code, p_getSize(p), buf);
+}
+
 static jboolean my_transact(JNIEnv *env, jobject thiz, jint code, jobject data, jobject reply, jint flags) {
     if (data != nullptr) {
         AParcel *p = p_fromJava(env, data);
         if (p != nullptr) {
             int r = patchCameraId(kOps, p, '0', targetChar);
-            if (r != 0) LOGI("ICameraService call code=%d (layout %d): camera 0 -> %c", code, r, (char) targetChar());
+            if (r != 0) {
+                LOGI("ICameraService call code=%d (layout %d): camera 0 -> %c", code, r, (char) targetChar());
+            } else if (g_dumpBudget > 0) {
+                dumpUnpatched(p, code);
+            }
             p_delete(p);
         }
     }
