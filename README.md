@@ -1,8 +1,43 @@
-# CameraOverride v0.5
+# CameraOverride v0.6
 
 Zygisk module for rear-camera redirection in Instagram, TikTok and Telegram.
 It redirects Java Camera2 service calls and the logical camera ID in capture
 requests. It does not add a zoom button or restrict itself to one Instagram screen.
+
+## v0.6 edge enhancement
+
+Instagram's redirected camera ID `3` now requests `EDGE_MODE_HIGH_QUALITY`.
+The supplied Poco dump lists this mode as supported. Android's driver determines
+the actual enhancement strength; this is a processing mode, not a numeric +10%
+slider, and it cannot correct optical defocus. If Instagram already requests
+HIGH_QUALITY, the value remains unchanged and no extra enhancement is added.
+
+Only the BYTE[1] value of the existing `android.edge.mode` entry is changed.
+Metadata layout, size, other keys, vendor values, physical settings, and surfaces
+remain intact. The full request array is validated before processing changes.
+FD-backed blobs, unknown formats, and missing edge keys are skipped with a
+diagnostic status. Enhancement applies only to Instagram's redirected ID `3`;
+other apps and other camera IDs keep their existing processing.
+
+Disable enhancement while keeping working camera redirection:
+
+```bat
+adb shell su -c "setprop debug.camoverride.sharpness off"
+adb shell am force-stop com.instagram.android
+```
+
+Restore enhancement with `setprop debug.camoverride.sharpness hq` and restart the
+app. The property is temporary and resets on reboot. Logs show:
+
+```text
+sharpness camera=3 edge_mode=1->2 changed=1 status=0
+```
+
+`changed=0` with `edge_mode=2` means it was already enabled; `status=1` means the
+blob format is unsupported, `status=2` means the key is absent, and negative
+statuses indicate a malformed range/metadata or write failure. Sharpening skips
+never undo the existing camera ID redirection. HIGH_QUALITY may reduce frame
+rate on some drivers; phone testing is necessary to assess appearance and speed.
 
 ## Poco X4 Pro 5G / crDroid 9.6
 

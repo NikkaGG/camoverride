@@ -70,6 +70,7 @@ struct CapturePatchResult {
     int patched = 0;
     int status = 0;
 };
+struct MetadataRange { int32_t start; int32_t end; };
 
 inline int skipString16(const ParcelOps &ops, void *p, int32_t *single = nullptr,
                         int32_t *wordPosition = nullptr) {
@@ -88,8 +89,10 @@ inline int skipString16(const ParcelOps &ops, void *p, int32_t *single = nullptr
 // Parcelable Surface array, cached stream/surface pairs, optional string tag.
 // Validate the entire array before changing any ID; preserve physical IDs and blobs.
 inline CapturePatchResult patchCaptureRequests(const ParcelOps &ops, void *p,
-        const CaptureDecoders &decoders, bool list, int32_t from, int32_t to) {
+        const CaptureDecoders &decoders, bool list, int32_t from, int32_t to,
+        std::vector<MetadataRange> *logicalMetadata = nullptr) {
     CapturePatchResult result;
+    if (logicalMetadata) logicalMetadata->clear();
     if (to < 0 || to == from) return result;
     const int32_t saved = ops.getPos(p);
     std::vector<int32_t> positions;
@@ -110,6 +113,8 @@ inline CapturePatchResult patchCaptureRequests(const ParcelOps &ops, void *p,
                 const int32_t start = ops.getPos(p);
                 if (decoders.metadata(decoders.context, p) != 0 ||
                     ops.getPos(p) <= start || ops.getPos(p) > ops.getSize(p)) return -5;
+                if (logicalMetadata && setting == 0 && id == from)
+                    logicalMetadata->push_back({start, ops.getPos(p)});
             }
             int32_t reprocess = 0, surfaces = 0, streams = 0;
             if (ops.readInt(p, &reprocess) != 0 || (reprocess != 0 && reprocess != 1) ||
@@ -152,6 +157,74 @@ inline CapturePatchResult patchCaptureRequests(const ParcelOps &ops, void *p,
             ++result.patched;
         }
     }
+    if (result.status != 0 && logicalMetadata) logicalMetadata->clear();
+    ops.setPos(p, saved);
+    return result;
+}
+
+struct EdgePatchResult {
+    bool changed = false;
+    int oldMode = -1;
+    int status = 0; // 1 = unsupported/FD blob, 2 = missing key, negative = malformed/write error
+};
+
+// CameraMetadata::writeToParcel: size, blob type, padded blob, alignment offset.
+// The stable camera_metadata_t v1 header has 32-bit sizes/offsets and 16-byte
+// entries. EDGE_MODE is a BYTE[1] value stored inside its typed entry, not a
+// strength slider. Modify only that byte of an existing inline metadata blob.
+// FD-backed blobs and unknown versions are deliberately left untouched.
+inline EdgePatchResult patchEdgeMode(const ParcelOps &ops, void *p, MetadataRange range, int mode) {
+    EdgePatchResult result;
+    const int32_t saved = ops.getPos(p);
+    const auto parse = [&]() -> int {
+        if (mode < 0 || mode > 3 || range.start < 0 || range.end < range.start || range.end > ops.getSize(p) ||
+            range.end - range.start < 12 || (range.start & 3) != 0 ||
+            ops.setPos(p, range.start) != 0) return -1;
+        int32_t blobSize = 0, blobType = -1;
+        if (ops.readInt(p, &blobSize) != 0 || ops.readInt(p, &blobType) != 0) return -1;
+        if (blobType != 0) return 1;
+        if (blobSize < 56 || blobSize > 64 * 1024 || (blobSize & 3) != 0 ||
+            static_cast<int64_t>(range.start) + 12 + blobSize != range.end) return -1;
+        const int32_t blobStart = ops.getPos(p);
+        std::vector<int32_t> words(blobSize / 4);
+        for (auto &word : words) if (ops.readInt(p, &word) != 0) return -1;
+        int32_t offset = -1;
+        if (ops.readInt(p, &offset) != 0 || offset < 0 || offset >= 8) return -1;
+        const auto *bytes = reinterpret_cast<const uint8_t *>(words.data());
+        const auto u32 = [&](uint32_t relative) -> uint32_t {
+            uint32_t value = 0;
+            memcpy(&value, bytes + offset + relative, sizeof(value));
+            return value;
+        };
+        if (blobSize - offset < 48) return -1;
+        const uint32_t packetSize = u32(0), version = u32(4), count = u32(12), capacity = u32(16);
+        const uint32_t entries = u32(20), dataCount = u32(24), dataCapacity = u32(28), data = u32(32);
+        if (version != 1) return 1;
+        if (packetSize < 48 || packetSize > static_cast<uint32_t>(blobSize - offset) ||
+            count > capacity || entries < 48 || (entries & 3) != 0 ||
+            static_cast<uint64_t>(entries) + static_cast<uint64_t>(capacity) * 16 > packetSize ||
+            data < static_cast<uint64_t>(entries) + static_cast<uint64_t>(capacity) * 16 ||
+            dataCount > dataCapacity || static_cast<uint64_t>(data) + dataCapacity > packetSize) return -1;
+        int32_t valueByte = -1;
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t entry = entries + i * 16;
+            if (u32(entry) != 0x00030000) continue; // ANDROID_EDGE_MODE
+            if (valueByte >= 0 || u32(entry + 4) != 1 || bytes[offset + entry + 12] != 0) return -1;
+            valueByte = offset + entry + 8;
+            result.oldMode = bytes[valueByte];
+            if (result.oldMode > 3) return -1;
+        }
+        if (valueByte < 0) return 2;
+        if (result.oldMode == mode) return 0;
+        const uint32_t shift = (valueByte & 3) * 8;
+        const uint32_t original = static_cast<uint32_t>(words[valueByte / 4]);
+        const uint32_t replacement = (original & ~(uint32_t(0xff) << shift)) | (uint32_t(mode) << shift);
+        if (ops.setPos(p, blobStart + (valueByte & ~3)) != 0 ||
+            ops.writeInt(p, static_cast<int32_t>(replacement)) != 0) return -2;
+        result.changed = true;
+        return 0;
+    };
+    result.status = parse();
     ops.setPos(p, saved);
     return result;
 }

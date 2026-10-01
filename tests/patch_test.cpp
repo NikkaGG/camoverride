@@ -111,6 +111,23 @@ static Parcel capture(bool list, int count = 1, bool tag = false, bool physical 
     p.pos = size(&p);
     return p;
 }
+static Parcel edgeMetadata(int mode = 1, int offset = 0) {
+    // 48-byte v1 header + two typed entries + 8 bytes of alignment padding.
+    std::vector<uint8_t> blob(88, 0);
+    const auto put = [&](int at, uint32_t value) { memcpy(blob.data() + offset + at, &value, 4); };
+    put(0, 80); put(4, 1); put(12, 2); put(16, 2); put(20, 48); put(32, 80);
+    put(40, 0xffffffff); put(44, 0xffffffff); // vendor ID unchanged
+    put(48, 0x30000); put(52, 1); put(56, uint32_t(mode) | 0x98765400); // inline BYTE[1]
+    put(64, 0x10000); put(68, 1); put(72, 0x11223301); // another typed value remains identical
+    Parcel p; p.words = {0xabcdef, 88, 0};
+    const auto begin = p.words.size();
+    p.words.resize(begin + blob.size() / 4);
+    memcpy(p.words.data() + begin, blob.data(), blob.size());
+    p.words.push_back(offset);
+    p.words.insert(p.words.end(), {1, '0', 99}); // following arguments unchanged
+    p.pos = size(&p);
+    return p;
+}
 int main() {
     int checks = 0;
     {
@@ -227,5 +244,54 @@ int main() {
         assert(patchCaptureRequests(ops, &p, decoders, true, '0', '3').status != 0);
         assert(p.words == before && p.pos == size(&p)); checks++;
     }
-    printf("Passed %d parcel checks (Binder objects, capture arrays, metadata preservation, truncation, front camera).\n", checks);
+    for (int offset = 0; offset < 8; ++offset) {
+        auto p = edgeMetadata(1, offset); auto expected = p.words;
+        const int byteAt = 12 + offset + 56;
+        auto *bytes = reinterpret_cast<uint8_t *>(expected.data()); bytes[byteAt] = 2;
+        const auto r = patchEdgeMode(ops, &p, {4, 104}, 2);
+        assert(r.changed && r.oldMode == 1 && r.status == 0 && p.words == expected && p.pos == size(&p));
+        checks++;
+    }
+    {
+        auto p = edgeMetadata(2); auto before = p.words;
+        auto r = patchEdgeMode(ops, &p, {4, 104}, 2);
+        assert(!r.changed && r.oldMode == 2 && r.status == 0 && p.words == before); checks++;
+        p.failWrite = true; r = patchEdgeMode(ops, &p, {4, 104}, 1);
+        assert(!r.changed && r.status == -2 && p.words == before && p.pos == size(&p)); checks++;
+    }
+    {
+        auto p = edgeMetadata(); p.words[2] = 1; p.binderAt = 12; p.binderSize = 28;
+        auto before = p.words;
+        const auto r = patchEdgeMode(ops, &p, {4, 104}, 2);
+        assert(!r.changed && r.status == 1 && p.words == before && p.pos == size(&p)); checks++;
+    }
+    // Every truncation, unknown metadata version, wrong type/count, missing or duplicate key is safe.
+    {
+        const auto original = edgeMetadata();
+        for (int end = 4; end < 104; end += 4) {
+            auto p = original; auto before = p.words;
+            assert(!patchEdgeMode(ops, &p, {4, end}, 2).changed);
+            assert(p.words == before && p.pos == size(&p));
+        }
+        checks++;
+        for (auto field : std::vector<std::pair<int, int32_t>>{
+                {3 + 1, 2}, {3 + 3, 10000}, {3 + 5, 10000},
+                {3 + 12, 0x30001}, {3 + 13, 2}, {3 + 15, 1}, {3 + 16, 0x30000}}) {
+            auto p = original; p.words[field.first] = field.second; auto before = p.words;
+            assert(!patchEdgeMode(ops, &p, {4, 104}, 2).changed);
+            assert(p.words == before && p.pos == size(&p)); checks++;
+        }
+    }
+    {
+        auto p = capture(true, 2, true, true);
+        std::vector<MetadataRange> ranges;
+        assert(patchCaptureRequests(ops, &p, decoders, true, '0', '3', &ranges).status == 0);
+        assert(ranges.size() == 2); // physical settings excluded
+        for (auto range : ranges) assert(range.end - range.start == 20);
+        checks++;
+        p.words.pop_back(); p.pos = size(&p);
+        assert(patchCaptureRequests(ops, &p, decoders, true, '0', '3', &ranges).status != 0);
+        assert(ranges.empty()); checks++;
+    }
+    printf("Passed %d parcel checks (Binder objects, capture arrays, bounded edge metadata, truncation, front camera).\n", checks);
 }

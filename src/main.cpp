@@ -112,6 +112,7 @@ static jclass g_metadataClass = nullptr, g_surfaceClass = nullptr;
 static jmethodID g_metadataCtor = nullptr, g_metadataRead = nullptr, g_metadataClose = nullptr;
 static jmethodID g_parcelReadBinder = nullptr, g_parcelReadParcelable = nullptr, g_surfaceRelease = nullptr;
 static bool g_requestTag = false;
+static bool g_sharpenApp = false;
 
 static bool resolveCaptureDecoders(JNIEnv *env) {
     const auto find = [&](const char *name) -> jclass {
@@ -260,7 +261,7 @@ static bool resolveCameraMethods(JNIEnv *env) {
     resolveMethods(env, "android/hardware/camera2/ICameraDeviceUser$Stub", kDeviceMethods);
     const bool ready = kMethods[0].code > 0 && kMethods[1].code > 0 &&
                        kDeviceMethods[5].code > 0 && kDeviceMethods[6].code > 0 && resolveCaptureDecoders(env);
-    LOGI("v0.5 transactions: connectDevice=%d getCameraCharacteristics=%d ready=%d",
+    LOGI("v0.6 transactions: connectDevice=%d getCameraCharacteristics=%d ready=%d",
          kMethods[0].code, kMethods[1].code, ready);
     return ready;
 }
@@ -314,6 +315,12 @@ static int32_t targetChar() {
     return '3';
 }
 
+static bool sharpeningEnabled() {
+    char value[PROP_VALUE_MAX] = {};
+    __system_property_get("debug.camoverride.sharpness", value);
+    return strcmp(value, "off") != 0 && strcmp(value, "0") != 0;
+}
+
 typedef jboolean (*transact_t)(JNIEnv *, jobject, jint, jobject, jobject, jint);
 static transact_t orig_transact = nullptr;
 
@@ -321,6 +328,7 @@ static transact_t orig_transact = nullptr;
 // interface token, so the real parcel layout of e.g. connectDevice can be read from logcat.
 static std::atomic<int> g_dumpBudget{120};
 static std::atomic<int> g_requestLogBudget{12};
+static std::atomic<int> g_edgeLogBudget{12};
 
 static void dumpUnpatched(const AParcel *p, jint code, const CameraMethod *method) {
     int32_t words[24] = {};
@@ -370,8 +378,20 @@ static jboolean my_transact(JNIEnv *env, jobject thiz, jint code, jobject data, 
                 if (redirectedTo >= 0 && strncmp(observed->name, "submitRequest", 13) == 0) {
                     DecodeContext ctx{env, data};
                     CaptureDecoders decoders{&ctx, decodeMetadata, decodeSurface, g_requestTag};
+                    std::vector<MetadataRange> metadata;
                     const auto r = patchCaptureRequests(kOps, p, decoders,
-                            strcmp(observed->name, "submitRequestList") == 0, '0', redirectedTo);
+                            strcmp(observed->name, "submitRequestList") == 0, '0', redirectedTo, &metadata);
+                    // Only this phone's verified ultrawide supports the requested mode.
+                    // Other apps/IDs retain their existing processing settings.
+                    if (r.status == 0 && g_sharpenApp && redirectedTo == '3' && sharpeningEnabled()) {
+                        for (auto range : metadata) {
+                            const auto edge = patchEdgeMode(kOps, p, range, 2); // EDGE_MODE_HIGH_QUALITY
+                            if (g_edgeLogBudget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+                                LOGI("sharpness camera=3 edge_mode=%d->2 changed=%d status=%d",
+                                     edge.oldMode, edge.changed, edge.status);
+                            }
+                        }
+                    }
                     if (r.status != 0 || g_requestLogBudget.fetch_sub(1, std::memory_order_relaxed) > 0) {
                         LOGI("ICameraDeviceUser method=%s requests=%d patched=%d camera=0->%c parse_status=%d",
                              observed->name, r.requests, r.patched, (char) redirectedTo, r.status);
@@ -450,6 +470,10 @@ public:
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         const char *name = env->GetStringUTFChars(args->nice_name, nullptr);
         target = isTarget(name);
+        const char *instagram = "com.instagram.android";
+        const size_t instagramLength = strlen(instagram);
+        g_sharpenApp = name && strncmp(name, instagram, instagramLength) == 0 &&
+                       (name[instagramLength] == '\0' || name[instagramLength] == ':');
         env->ReleaseStringUTFChars(args->nice_name, name);
         if (target) methodsReady = resolveCameraMethods(env);
         // Non-target app: unload this module from the process entirely.
